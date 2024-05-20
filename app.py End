@@ -1,0 +1,260 @@
+from flask import Flask, render_template, request, jsonify
+import pymysql
+import pyttsx3
+import speech_recognition as sr
+import datetime
+from openai import OpenAI
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+
+app = Flask(__name__)
+
+# MySQL 연결
+conn = pymysql.connect(host='ls-94e556626c88eb365a7ec359470d1d33f56b67c1.ch0q0mic69gt.ap-northeast-2.rds.amazonaws.com', user='dbmasteruser', password='', db="nadongban", charset='utf8') 
+
+cursor = conn.cursor()
+
+# 음성 인식 관련 설정
+recognizer = sr.Recognizer()
+today = "2024-5-20"
+insert_sql = '''INSERT INTO Health (Alcohol, Outside, Exercise, Today, Content) VALUES (%s, %s, %s, %s, %s)'''
+# openai키
+api = ""
+client = OpenAI(api_key=api)
+
+# 메인 페이지 라우트
+@app.route('/')
+def index():
+    # 데이터베이스에서 정보를 가져옴
+    cursor.execute("SELECT * FROM Health")
+    data = cursor.fetchall()
+    return render_template('index.html', data=data)
+
+# 음성 데이터 처리 라우트
+@app.route('/process_voice_data', methods=['POST'])
+def process_voice_data():
+    cursor.execute("SELECT 1 FROM Health WHERE Today = %s LIMIT 1", (today,))
+    if cursor.fetchone():
+        # 데이터가 이미 존재하면 처리하지 않고 메시지 반환
+        return jsonify({'error': 'Data for today already exists.'}), 400
+    try:
+        with sr.Microphone() as source:
+            print("오늘 하루 어땠는지 말씀해주세요.")
+            audio = recognizer.listen(source)
+            # Google Web Speech API를 이용해 음성을 텍스트로 변환
+            text = recognizer.recognize_google(audio, language="ko-KR")
+            print("음성 인식 결과:", text)
+            sptext = "분석중입니다. 잠시 기달려주세요."
+
+            try:
+                engine = pyttsx3.init()  # TTS 엔진 초기화
+                engine.say(sptext)  # 변환할 텍스트 설정
+                engine.runAndWait()  # 음성 변환 실행 및 대기
+            except Exception as e:
+                print(f"음성 변환 중 에러 발생: {e}")
+            finally:
+                engine.stop()  # 엔진 사용 후 자원 해제
+
+        # Drink Alcohol
+        completion = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "음주를 했으면 1을 반환하고 음주를 하지 않았으면 2를 반환해줘"},
+                {"role": "user", "content": text}
+            ]
+        )
+
+        if "1" in completion.choices[0].message.content:
+            Alcohol = 1
+        else:
+            Alcohol = 0
+
+        print("음주 여부 : ", Alcohol)
+
+        # Outside
+        completion = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "외출을 했으면 1을 반환하고 외출을 하지 않았으면 2를 반환해줘"},
+                {"role": "user", "content": text}
+            ]
+        )
+        if "1" in completion.choices[0].message.content:
+            OutSide = 1
+        else:
+            OutSide = 0
+
+        print("외출 여부 : ", OutSide)
+
+        # Exercise
+        completion = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "운동을 했으면 1을 반환하고 운동을 하지 않았으면 2를 반환해줘"},
+                {"role": "user", "content": text}
+            ]
+        )
+        if "1" in completion.choices[0].message.content:
+            Exercise = 1
+        else:
+            Exercise = 0
+
+        print("운동 여부 : ", Exercise)
+
+        cursor.execute(insert_sql, (Alcohol, OutSide, Exercise, today, text))
+        conn.commit()
+
+        # 처리 완료 후 데이터베이스에서 정보를 가져와서 반환
+        cursor.execute("SELECT * FROM Health")
+        data = cursor.fetchall()
+
+        # SMTP 서버 정보 설정
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+
+        # 보내는 사람 정보
+        from_email = "rltmd5247@gmail.com"
+        from_password = "qqis qapc qfkt cwqo"
+
+        # 받는 사람 정보
+        to_email = "dlrltmd5247@naver.com"
+
+        # MIME 객체 생성
+        msg = MIMEMultipart()
+        msg['Subject'] = '금일 건강 달력 결과입니다.'
+        msg['From'] = from_email
+        msg['To'] = to_email
+
+        # 이메일 본문 추가
+        body = f"""
+        음주 여부 : {Alcohol}
+        운동 여부 : {Exercise}
+        외출 여부 : {OutSide}
+        날짜 : {today}
+        메시지 : {text}
+        """
+
+        msg.attach(MIMEText(body, 'plain'))
+
+        # SMTP 서버에 연결
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()  # TLS 보안 시작
+        server.login(from_email, from_password)  # 로그인 인증
+
+        # 이메일 전송
+        server.sendmail(from_email, to_email, msg.as_string())
+
+        # 서버 연결 종료
+        server.quit()
+
+        return jsonify(data)
+
+    except sr.UnknownValueError:
+        print("음성을 인식할 수 없습니다.")
+        return jsonify({'error': '음성을 인식할 수 없습니다.'})
+    except sr.RequestError as e:
+        print(f"음성 인식 서비스에 접근할 수 없습니다: {e}")
+        return jsonify({'error': '음성 인식 서비스에 접근할 수 없습니다.'})
+
+
+# 선택한 날짜 처리 라우트
+@app.route('/process_selected_date', methods=['GET'])
+def process_selected_date():
+    selected_date = request.args.get('date')
+    cursor.execute("SELECT alcohol, outside, exercise, content FROM Health WHERE today = %s ORDER BY id DESC LIMIT 1;", (selected_date,))
+    data = cursor.fetchone()
+    if data:
+        # 데이터가 존재하는 경우에만 JSON 형식으로 반환합니다.
+        return jsonify({'date': selected_date, 'alcohol': data[0], 'outside': data[1], 'exercise': data[2], 'content':data[3]})
+    else:
+        # 데이터가 없는 경우 오류 메시지를 반환합니다.
+        return jsonify({'error': 'No data found for the selected date.'}), 404
+
+@app.route('/get-data-for-date', methods=['POST'])
+def get_data_for_date():
+    # 요청의 JSON 본문에서 날짜를 추출합니다.
+    date = request.json.get('date')
+    if date:
+        # 여기서 해당 날짜에 대한 데이터베이스 쿼리를 수행합니다.
+        # 일단은 가짜 응답을 반환합니다.
+        data = {'message': date + '에 대한 데이터'}
+        return jsonify(data)
+    else:
+        # 날짜가 제공되지 않으면 오류 응답을 반환합니다.
+        return jsonify({'error': '날짜가 제공되지 않았습니다.'}), 400
+
+@app.route('/check_date_data', methods=['POST'])
+def check_date_data():
+    dates = request.json.get('dates')
+    if not dates:
+        return jsonify({'error': 'No dates provided'}), 400
+
+    placeholder = ', '.join(['%s'] * len(dates))
+    query = f"SELECT today, alcohol, exercise FROM Health WHERE today IN ({placeholder})"
+    cursor.execute(query, dates)
+    results = cursor.fetchall()
+
+    # 결과 데이터를 처리하여 응답 데이터 구성
+    dates_data = {}
+    for result in results:
+        date, alcohol, exercise = result
+        formatted_date = date.strftime('%Y-%m-%d')
+        dates_data[formatted_date] = {
+            'hasData': True,
+            'alcohol': bool(alcohol),
+            'exercise': bool(exercise)
+        }
+
+    # 요청받은 모든 날짜에 대해 데이터가 없는 경우도 처리
+    for date in dates:
+        if date not in dates_data:
+            dates_data[date] = {'hasData': False}
+
+    return jsonify(dates_data)
+
+@app.route('/get-monthly-stats', methods=['POST'])
+def get_monthly_stats():
+    month = request.json['month']
+    query = """
+        SELECT 
+            SUM(alcohol) as alcohol_count, 
+            SUM(outside) as outside_count, 
+            SUM(exercise) as exercise_count 
+        FROM Health 
+        WHERE DATE_FORMAT(today, '%Y-%m') = %s;
+    """
+    cursor.execute(query, (month,))
+    result = cursor.fetchone()
+    return jsonify({
+        'alcohol': int(result[0] or 0),
+        'outside': int(result[1] or 0),
+        'exercise': int(result[2] or 0)
+    })
+
+@app.route('/get-monthly-data', methods=['POST'])
+def get_monthly_data():
+    month = request.json['month']
+    try:
+        # DATE_FORMAT의 포맷 문자열에서 %%Y와 %%m 사용
+        query = """
+            SELECT 
+                SUM(alcohol) as alcohol_count, 
+                SUM(outside) as outside_count, 
+                SUM(exercise) as exercise_count 
+            FROM Health 
+            WHERE DATE_FORMAT(today, '%%Y-%%m') = %s;
+        """
+        cursor.execute(query, (month,))
+        results = cursor.fetchone()
+        return jsonify({
+            'alcohol': int(results[0] or 0),
+            'outside': int(results[1] or 0),
+            'exercise': int(results[2] or 0)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
